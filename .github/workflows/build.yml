@@ -1,0 +1,333 @@
+name: build
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.12
+      - name: Write project files
+        run: |
+          mkdir -p src/main/java/dev/roulette src/main/resources
+          echo "rootProject.name = 'Roulette'" > settings.gradle
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'java'
+          }
+
+          group = 'dev.roulette'
+          version = '1.0'
+
+          repositories {
+              mavenCentral()
+              maven { url = 'https://repo.papermc.io/repository/maven-public/' }
+          }
+
+          dependencies {
+              compileOnly 'com.destroystokyo.paper:paper-api:1.16.5-R0.1-SNAPSHOT'
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 8
+              options.encoding = 'UTF-8'
+          }
+
+          jar {
+              archiveFileName = 'Roulette.jar'
+          }
+          EOF_FILE
+          cat > src/main/resources/plugin.yml <<'EOF_FILE'
+          name: Roulette
+          version: '1.0'
+          main: dev.roulette.RoulettePlugin
+          api-version: '1.16'
+          description: Random player roulette with rewards
+          commands:
+            roulette:
+              description: Roulette commands
+              usage: /roulette <start|reload>
+              permission: roulette.use
+              aliases: [rul]
+          permissions:
+            roulette.use:
+              description: Allows starting the roulette
+              default: op
+            roulette.reload:
+              description: Allows reloading the config
+              default: op
+          EOF_FILE
+          cat > src/main/resources/config.yml <<'EOF_FILE'
+          # Сколько секунд крутится рулетка
+          spin-time-seconds: 6
+
+          # Минимум игроков онлайн, чтобы запустить рулетку
+          min-players: 2
+
+          # Звуки при прокрутке и победе
+          sounds: true
+
+          # Награды. Шанс выпадения зависит от weight (чем больше, тем чаще).
+          # name - название в сообщениях (цвета через &, например &b)
+          # commands - команды от имени консоли, %player% заменится на ник победителя
+          rewards:
+            diamonds:
+              name: "&b5 алмазов"
+              weight: 50
+              commands:
+                - "give %player% minecraft:diamond 5"
+            golden_apples:
+              name: "&63 золотых яблока"
+              weight: 30
+              commands:
+                - "give %player% minecraft:golden_apple 3"
+            xp:
+              name: "&a30 уровней опыта"
+              weight: 15
+              commands:
+                - "xp add %player% 30 levels"
+            netherite:
+              name: "&5Незеритовый слиток"
+              weight: 5
+              commands:
+                - "give %player% minecraft:netherite_ingot 1"
+          EOF_FILE
+          cat > src/main/resources/messages.yml <<'EOF_FILE'
+          # Все тексты плагина. Цвета через &. Для другого языка просто переведи значения.
+          # Не меняй метки %player%, %reward% и %min%, они подставляются автоматически.
+          prefix: "&7[&6Рулетка&7] "
+          started: "&eРулетка запущена! Кому достанется награда?"
+          spinning-subtitle: "&7Рулетка крутится..."
+          winner-subtitle: "&aНаграда: &f%reward%"
+          winner-broadcast: "&a%player% &eвыиграл в рулетке: &f%reward%"
+          not-enough-players: "&cДля рулетки нужно минимум %min% игроков онлайн."
+          already-running: "&cРулетка уже запущена."
+          no-rewards: "&cВ config.yml не настроены награды."
+          no-permission: "&cУ тебя нет прав на эту команду."
+          reloaded: "&aКонфиги перезагружены."
+          usage: "&eИспользование: /roulette <start|reload>"
+          EOF_FILE
+          cat > src/main/java/dev/roulette/RoulettePlugin.java <<'EOF_FILE'
+          package dev.roulette;
+
+          import org.bukkit.ChatColor;
+          import org.bukkit.command.PluginCommand;
+          import org.bukkit.configuration.file.YamlConfiguration;
+          import org.bukkit.plugin.java.JavaPlugin;
+
+          import java.io.File;
+
+          public class RoulettePlugin extends JavaPlugin {
+              private YamlConfiguration messages;
+              private RouletteGame game;
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  loadMessages();
+                  game = new RouletteGame(this);
+
+                  PluginCommand command = getCommand("roulette");
+                  if (command != null) {
+                      RouletteCommand handler = new RouletteCommand(this, game);
+                      command.setExecutor(handler);
+                      command.setTabCompleter(handler);
+                  }
+              }
+
+              public void reloadAll() {
+                  reloadConfig();
+                  loadMessages();
+              }
+
+              private void loadMessages() {
+                  File file = new File(getDataFolder(), "messages.yml");
+                  if (!file.exists()) {
+                      saveResource("messages.yml", false);
+                  }
+                  messages = YamlConfiguration.loadConfiguration(file);
+              }
+
+              public String color(String text) {
+                  return ChatColor.translateAlternateColorCodes('&', text);
+              }
+
+              /** Message with the plugin prefix. replacements: key1, value1, key2, value2... */
+              public String message(String key, String... replacements) {
+                  return color(messages.getString("prefix", "")) + text(key, replacements);
+              }
+
+              /** Message without the prefix (titles). */
+              public String text(String key, String... replacements) {
+                  String raw = messages.getString(key, "&cMissing message: " + key);
+                  for (int i = 0; i + 1 < replacements.length; i += 2) {
+                      raw = raw.replace(replacements[i], replacements[i + 1]);
+                  }
+                  return color(raw);
+              }
+          }
+          EOF_FILE
+          cat > src/main/java/dev/roulette/RouletteCommand.java <<'EOF_FILE'
+          package dev.roulette;
+
+          import org.bukkit.command.Command;
+          import org.bukkit.command.CommandExecutor;
+          import org.bukkit.command.CommandSender;
+          import org.bukkit.command.TabCompleter;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class RouletteCommand implements CommandExecutor, TabCompleter {
+              private final RoulettePlugin plugin;
+              private final RouletteGame game;
+
+              public RouletteCommand(RoulettePlugin plugin, RouletteGame game) {
+                  this.plugin = plugin;
+                  this.game = game;
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (args.length == 0) {
+                      sender.sendMessage(plugin.message("usage"));
+                      return true;
+                  }
+
+                  String sub = args[0].toLowerCase();
+                  if (sub.equals("start")) {
+                      game.start(sender);
+                  } else if (sub.equals("reload")) {
+                      if (!sender.hasPermission("roulette.reload")) {
+                          sender.sendMessage(plugin.message("no-permission"));
+                          return true;
+                      }
+                      plugin.reloadAll();
+                      sender.sendMessage(plugin.message("reloaded"));
+                  } else {
+                      sender.sendMessage(plugin.message("usage"));
+                  }
+                  return true;
+              }
+
+              @Override
+              public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+                  List<String> result = new ArrayList<String>();
+                  if (args.length == 1) {
+                      for (String s : new String[] {"start", "reload"}) {
+                          if (s.startsWith(args[0].toLowerCase())) {
+                              result.add(s);
+                          }
+                      }
+                  }
+                  return result;
+              }
+          }
+          EOF_FILE
+          cat > src/main/java/dev/roulette/RouletteGame.java <<'EOF_FILE'
+          package dev.roulette;
+
+          import org.bukkit.Bukkit;
+          import org.bukkit.ChatColor;
+          import org.bukkit.Sound;
+          import org.bukkit.command.CommandSender;
+          import org.bukkit.configuration.ConfigurationSection;
+          import org.bukkit.entity.Player;
+          import org.bukkit.scheduler.BukkitRunnable;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Random;
+
+          public class RouletteGame {
+              private final RoulettePlugin plugin;
+              private final Random random = new Random();
+              private boolean running;
+
+              private static class Reward {
+                  final String name;
+                  final int weight;
+                  final List<String> commands;
+
+                  Reward(String name, int weight, List<String> commands) {
+                      this.name = name;
+                      this.weight = weight;
+                      this.commands = commands;
+                  }
+              }
+
+              public RouletteGame(RoulettePlugin plugin) {
+                  this.plugin = plugin;
+              }
+
+              public void start(CommandSender starter) {
+                  if (running) {
+                      starter.sendMessage(plugin.message("already-running"));
+                      return;
+                  }
+
+                  List<Player> players = new ArrayList<Player>(Bukkit.getOnlinePlayers());
+                  int min = Math.max(1, plugin.getConfig().getInt("min-players", 2));
+                  if (players.size() < min) {
+                      starter.sendMessage(plugin.message("not-enough-players", "%min%", String.valueOf(min)));
+                      return;
+                  }
+
+                  List<Reward> rewards = loadRewards();
+                  if (rewards.isEmpty()) {
+                      starter.sendMessage(plugin.message("no-rewards"));
+                      return;
+                  }
+
+                  running = true;
+                  final Player winner = players.get(random.nextInt(players.size()));
+                  final Reward reward = pickReward(rewards);
+                  final int totalTicks = Math.max(1, plugin.getConfig().getInt("spin-time-seconds", 6)) * 20;
+                  final boolean sounds = plugin.getConfig().getBoolean("sounds", true);
+
+                  Bukkit.broadcastMessage(plugin.message("started"));
+
+                  new BukkitRunnable() {
+                      int tick = 0;
+                      int next = 0;
+
+                      @Override
+                      public void run() {
+                          if (tick >= totalTicks) {
+                              cancel();
+                              finish(winner, reward, sounds);
+                              return;
+                          }
+
+                          if (tick >= next) {
+                              List<Player> online = new ArrayList<Player>(Bukkit.getOnlinePlayers());
+                              if (online.isEmpty()) {
+                                  cancel();
+                                  running = false;
+                                  return;
+                              }
+                              Player shown = online.get(random.nextInt(online.size()));
+                              String subtitle = plugin.text("spinning-subtitle");
+                              for (Player p : online) {
+                                  p.sendTitle(ChatColor.GOLD + shown.getName(), subtitle, 0, 12, 0);
+                                  if (sounds) {
+                                      p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_HAT, 0.7f, 1.2f);
+                                  }
+                              }
+                              // the wheel slows down towards the end
+                              next = tick + 2 + (tick * 8) / totalTicks;
+                          }
+                          tick++;
+                      }
+                  }.runTaskTimer(plugin, 0L, 1L);
+              }
+
+              private void
